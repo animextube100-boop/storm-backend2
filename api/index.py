@@ -1,17 +1,35 @@
-import os, hmac, hashlib, json, time
+import os, re, hmac, hashlib, json, time, secrets, base64, uuid, logging
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
-import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+logger = logging.getLogger("storm-payments")
 app = FastAPI(title="STORM Payment Verification API")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
+
+# ----------------------------------------------------------------- config ---
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").rstrip("/")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TONAPI_KEY = os.getenv("TONAPI_KEY", "")
+# Override with https://testnet.tonapi.io when testing on TON testnet.
+TONAPI_BASE_URL = os.getenv("TONAPI_BASE_URL", "https://tonapi.io").rstrip("/")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
-PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "UQCo0-D4DWT4Q99BJ35ONA7wduh_qtNwwpni55UyMhsFcY-x")
+PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "").strip()
+
+PAYMENT_WINDOW_SECONDS = 240          # fixed, never extended
+# Seconds allowed between request expiry and the /verify-payment HTTP call.
+# 0 = strict (default). The on-chain timestamp must ALWAYS be inside the window.
+VERIFY_GRACE_SECONDS = int(os.getenv("VERIFY_GRACE_SECONDS", "0"))
+MAX_PENDING_PER_USER = 5
+TONAPI_TIMEOUT = 8                    # Vercel Hobby functions are limited to ~10s
+SUPABASE_TIMEOUT = 5
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +39,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# Unchanged from the original file (nanoTON).
 PAYMENTS = {
     "verification": 500_000_000,
     "basic": 1_000_000_000,
@@ -30,12 +49,43 @@ PAYMENTS = {
     "legendary": 25_000_000_000,
 }
 
-class VerifyRequest(BaseModel):
-    init_data: str = Field(min_length=1)
-    tx_hash: str = Field(min_length=8, max_length=256)
-    payment_type: str
+HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
+B64URL = re.compile(r"^[A-Za-z0-9_-]{43}={0,1}$")
 
-def validate_init_data(raw):
+
+# ------------------------------------------------------- JSON error format ---
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        {"ok": False, "error": exc.detail, "detail": exc.detail},
+        status_code=exc.status_code,
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    fields = [{"loc": [str(x) for x in e.get("loc", [])], "msg": e.get("msg", "")} for e in exc.errors()]
+    return JSONResponse(
+        {"ok": False, "error": "Invalid request body", "detail": "Invalid request body", "fields": fields},
+        status_code=422,
+    )
+
+
+# ---------------------------------------------------------------- models ---
+class CreatePaymentRequest(BaseModel):
+    init_data: str = Field(min_length=1, max_length=8192)
+    payment_type: str = Field(min_length=1, max_length=32)
+
+
+class VerifyRequest(BaseModel):
+    init_data: str = Field(min_length=1, max_length=8192)
+    tx_hash: str = Field(min_length=8, max_length=512)
+    payment_request_id: uuid.UUID
+
+
+# ------------------------------------------------------------- telegram ---
+def validate_init_data(raw: str) -> str:
     if not BOT_TOKEN:
         raise HTTPException(500, "BOT_TOKEN is not configured")
     try:
@@ -52,87 +102,399 @@ def validate_init_data(raw):
     if not hmac.compare_digest(expected, received_hash):
         raise HTTPException(401, "Telegram initData signature is invalid")
     try:
-        return str(json.loads(values["user"])["id"])
+        return str(int(json.loads(values["user"])["id"]))
     except Exception:
         raise HTTPException(401, "Telegram user data missing")
 
-def supabase_headers():
+
+# ------------------------------------------------------------- supabase ---
+def _sb_headers(prefer):
     if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
         raise HTTPException(500, "Supabase environment variables are missing")
-    return {
+    h = {
         "apikey": SUPABASE_SECRET_KEY,
         "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation",
     }
+    if prefer:
+        h["Prefer"] = prefer
+    return h
 
+
+async def sb(method, path, *, params=None, body=None, prefer="return=representation"):
+    headers = _sb_headers(prefer)
+    try:
+        async with httpx.AsyncClient(timeout=SUPABASE_TIMEOUT) as client:
+            return await client.request(
+                method, f"{SUPABASE_URL}/rest/v1/{path}", headers=headers, params=params, json=body
+            )
+    except httpx.HTTPError:
+        raise HTTPException(503, "Database temporarily unavailable, try again")
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_ts(s: str) -> datetime:
+    """Parse PostgREST timestamptz strings (fraction may have 1-6 digits, tz may be +00)."""
+    s = s.strip().replace("Z", "+00:00").replace(" ", "T")
+    m = re.match(r"^(.*?)(\.\d+)?([+-]\d\d)(?::?(\d\d))?$", s)
+    if not m:
+        raise ValueError(f"bad timestamp {s!r}")
+    base, frac, tzh, tzm = m.groups()
+    frac = (frac or ".0")[:7].ljust(7, "0")
+    return datetime.fromisoformat(f"{base}{frac}{tzh}:{tzm or '00'}").astimezone(timezone.utc)
+
+
+async def get_payment_request(request_id: str):
+    r = await sb("GET", "payment_requests", params={"id": f"eq.{request_id}", "select": "*", "limit": "1"})
+    if r.status_code != 200:
+        raise HTTPException(502, "Could not read payment request")
+    rows = r.json()
+    return rows[0] if rows else None
+
+
+async def set_request_status(request_id: str, new_status: str):
+    """Best-effort pending -> expired/rejected. Never touches verified rows."""
+    try:
+        await sb("PATCH", "payment_requests",
+                 params={"id": f"eq.{request_id}", "status": "eq.pending"},
+                 body={"status": new_status}, prefer="return=minimal")
+    except HTTPException:
+        pass
+
+
+# ------------------------------------------------------------ TON helpers ---
+def _crc16_xmodem(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else (crc << 1)
+            crc &= 0xFFFF
+    return crc
+
+
+def parse_ton_address(addr):
+    """Return (workchain, 32-byte hash) for raw ('0:abc..') or friendly (EQ/UQ/kQ/0Q) forms."""
+    if not isinstance(addr, str):
+        raise ValueError("address is not a string")
+    addr = addr.strip()
+    if ":" in addr:
+        wc, h = addr.split(":", 1)
+        if not HEX64.match(h):
+            raise ValueError("bad raw address")
+        return int(wc), bytes.fromhex(h)
+    if len(addr) != 48:
+        raise ValueError("bad friendly address length")
+    raw = base64.urlsafe_b64decode(addr.replace("+", "-").replace("/", "_"))
+    if len(raw) != 36 or _crc16_xmodem(raw[:34]) != int.from_bytes(raw[34:], "big"):
+        raise ValueError("bad friendly address checksum")
+    if (raw[0] & 0x7F) not in (0x11, 0x51):
+        raise ValueError("bad friendly address tag")
+    return int.from_bytes(raw[1:2], "big", signed=True), raw[2:34]
+
+
+def same_address(a, b) -> bool:
+    try:
+        return parse_ton_address(a) == parse_ton_address(b)
+    except Exception:
+        return False
+
+
+def addr_str(field):
+    """TONAPI returns an object {"address": ...}; older shapes return a bare string."""
+    if isinstance(field, dict):
+        return field.get("address")
+    return field if isinstance(field, str) else None
+
+
+def _comment_from_boc_hex(raw_hex):
+    """Minimal BOC reader: single-cell, no-ref text comment (op 0x00000000). Else None."""
+    try:
+        d = bytes.fromhex(raw_hex)
+        if d[:4] != bytes.fromhex("b5ee9c72"):
+            return None
+        flags = d[4]
+        size, off = flags & 7, d[5]
+        pos = 6
+        cells = int.from_bytes(d[pos:pos + size], "big"); pos += size
+        roots = int.from_bytes(d[pos:pos + size], "big"); pos += size
+        pos += size + off                      # absent, tot_cells_size
+        root_idx = int.from_bytes(d[pos:pos + size], "big"); pos += roots * size
+        if flags & 0x80:                       # has index
+            pos += cells * off
+        if root_idx != 0:
+            return None
+        d1, d2 = d[pos], d[pos + 1]
+        if (d1 & 7) != 0 or (d1 & 8) != 0 or (d2 & 1):
+            return None                        # has refs / exotic / non-byte-aligned: do not guess
+        data = d[pos + 2: pos + 2 + d2 // 2]
+        if data[:4] != b"\x00\x00\x00\x00":
+            return None
+        return data[4:].decode("utf-8")
+    except Exception:
+        return None
+
+
+def extract_comment(in_msg: dict):
+    """Plain-text comment of an incoming message, or None. Never guesses."""
+    op_name = in_msg.get("decoded_op_name")
+    op_code = in_msg.get("op_code")
+    is_text = op_name == "text_comment"
+    if not is_text and isinstance(op_code, str):
+        try:
+            is_text = int(op_code, 16) == 0
+        except ValueError:
+            pass
+    body = in_msg.get("decoded_body")
+    if is_text and isinstance(body, dict):
+        for k, v in body.items():              # tolerate "text"/"Text"/"comment"
+            if k.lower() in ("text", "comment") and isinstance(v, str):
+                return v
+    raw = in_msg.get("raw_body")
+    if isinstance(raw, str) and raw:
+        return _comment_from_boc_hex(raw)
+    return None
+
+
+async def fetch_transaction(tx_hash: str) -> dict:
+    if not TONAPI_KEY:
+        raise HTTPException(500, "TONAPI_KEY is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=TONAPI_TIMEOUT) as client:
+            r = await client.get(
+                f"{TONAPI_BASE_URL}/v2/blockchain/transactions/{tx_hash}",
+                headers={"Authorization": f"Bearer {TONAPI_KEY}"},
+            )
+    except httpx.HTTPError:
+        raise HTTPException(503, "TON API unreachable, try again shortly")
+    if r.status_code == 404:
+        raise HTTPException(404, "Transaction not found yet. It may still be indexing - retry in a few seconds.")
+    if r.status_code == 429:
+        raise HTTPException(503, "TON API rate limit reached, retry shortly", headers={"Retry-After": "5"})
+    if r.status_code != 200:
+        raise HTTPException(502, "TON transaction lookup failed")
+    try:
+        data = r.json()
+    except ValueError:
+        raise HTTPException(502, "TON API returned an invalid response")
+    if not isinstance(data, dict):
+        raise HTTPException(502, "TON API returned an unexpected response")
+    return data
+
+
+
+async def fetch_trace(tx_hash: str) -> dict:
+    """Resolve a wallet-side transaction hash to every transaction in its TON trace."""
+    if not TONAPI_KEY:
+        raise HTTPException(500, "TONAPI_KEY is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=TONAPI_TIMEOUT) as client:
+            r = await client.get(
+                f"{TONAPI_BASE_URL}/v2/traces/{tx_hash}",
+                headers={"Authorization": f"Bearer {TONAPI_KEY}"},
+            )
+    except httpx.HTTPError:
+        raise HTTPException(503, "TON API unreachable, try again shortly")
+    if r.status_code == 404:
+        raise HTTPException(404, "Transaction trace not found yet. Retry in a few seconds.")
+    if r.status_code == 429:
+        raise HTTPException(503, "TON API rate limit reached, retry shortly", headers={"Retry-After": "5"})
+    if r.status_code != 200:
+        raise HTTPException(502, "TON transaction trace lookup failed")
+    data = r.json()
+    if not isinstance(data, dict):
+        raise HTTPException(502, "TON API returned an unexpected trace response")
+    return data
+
+
+def walk_dicts(value):
+    """Walk nested TONAPI trace JSON without assuming a single trace nesting layout."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_dicts(child)
+
+
+def tx_candidates(trace: dict):
+    seen = set()
+    for item in walk_dicts(trace):
+        if isinstance(item.get("in_msg"), dict) and item.get("utime") is not None and item.get("hash"):
+            h = str(item.get("hash")).lower()
+            if h not in seen:
+                seen.add(h)
+                yield item
+
+
+def normalize_tx_hash(raw: str) -> str:
+    h = raw.strip()
+    if "://" in h:
+        h = h.split("?")[0].split("#")[0].rstrip("/").split("/")[-1]
+    if HEX64.match(h) or B64URL.match(h):
+        return h
+    raise HTTPException(400, "Invalid transaction hash (expected 64-character hex hash or explorer link)")
+
+
+# -------------------------------------------------------------- endpoints ---
 @app.get("/health")
 async def health():
     return {"ok": True, "service": "storm-payment-verification"}
 
-@app.post("/verify-payment")
-async def verify_payment(body: VerifyRequest):
+
+@app.post("/create-payment")
+async def create_payment(body: CreatePaymentRequest):
     if body.payment_type not in PAYMENTS:
         raise HTTPException(400, "Unknown payment type")
     user_id = validate_init_data(body.init_data)
-    tx_hash = body.tx_hash.strip()
-    if "://" in tx_hash:
-        tx_hash = tx_hash.rstrip("/").split("/")[-1].split("?")[0]
-    if not TONAPI_KEY:
-        raise HTTPException(500, "TONAPI_KEY is not configured")
-
-    headers = {"Authorization": f"Bearer {TONAPI_KEY}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(
-            f"https://tonapi.io/v2/blockchain/transactions/{tx_hash}",
-            headers=headers
-        )
-    if response.status_code == 404:
-        raise HTTPException(400, "Transaction not found")
-    if response.status_code != 200:
-        raise HTTPException(502, "TON transaction lookup failed")
-    tx = response.json()
-
-    if tx.get("aborted") is True or tx.get("success") is False:
-        raise HTTPException(400, "Transaction failed or was aborted")
-    in_msg = tx.get("in_msg") or {}
-    if not in_msg:
-        raise HTTPException(400, "No incoming payment message found")
-
-    destination = in_msg.get("destination") or {}
-    dest = destination.get("address") if isinstance(destination, dict) else destination
-    if not dest or dest != PAYMENT_WALLET:
-        raise HTTPException(400, "Payment destination does not match STORM wallet")
-
+    if not PAYMENT_WALLET:
+        raise HTTPException(500, "PAYMENT_WALLET is not configured")
     try:
-        paid_nano = int(in_msg.get("value"))
-    except Exception:
-        raise HTTPException(400, "Could not read incoming TON amount")
-    expected_nano = PAYMENTS[body.payment_type]
-    if paid_nano != expected_nano:
-        raise HTTPException(400, "Payment amount does not match selected payment type")
+        parse_ton_address(PAYMENT_WALLET)
+    except ValueError:
+        raise HTTPException(500, "PAYMENT_WALLET is not a valid TON address")
 
-    source = in_msg.get("source") or {}
-    sender = source.get("address") if isinstance(source, dict) else source
+    now = utcnow().replace(microsecond=0)
+    expires = now + timedelta(seconds=PAYMENT_WINDOW_SECONDS)
+    r = await sb("GET", "payment_requests", params={
+        "telegram_user_id": f"eq.{user_id}", "status": "eq.pending",
+        "expires_at": f"gt.{now.isoformat()}", "select": "id", "limit": str(MAX_PENDING_PER_USER),
+    })
+    if r.status_code != 200:
+        raise HTTPException(502, "Could not check existing payment requests")
+    if len(r.json()) >= MAX_PENDING_PER_USER:
+        raise HTTPException(429, "Too many open payment requests, wait for them to expire")
+
     record = {
-        "tx_hash": tx_hash,
+        "id": str(uuid.uuid4()),
         "telegram_user_id": user_id,
         "payment_type": body.payment_type,
-        "amount_nano": paid_nano,
-        "sender_address": sender,
-        "destination_address": dest,
+        "amount_nano": PAYMENTS[body.payment_type],
+        "destination_address": PAYMENT_WALLET,
+        "unique_comment": None,
+        "status": "pending",
+        "created_at": now.isoformat(),
+        "expires_at": expires.isoformat(),
     }
-    async with httpx.AsyncClient(timeout=20) as client:
-        saved = await client.post(
-            f"{SUPABASE_URL}/rest/v1/payment_claims",
-            headers=supabase_headers(),
-            json=record
-        )
-    if saved.status_code == 409:
-        raise HTTPException(409, "This transaction hash has already been claimed")
+    saved = await sb("POST", "payment_requests", body=record)
     if saved.status_code not in (200, 201):
-        raise HTTPException(502, "Could not save payment claim")
+        logger.error("payment_requests insert failed: %s %s", saved.status_code, saved.text[:300])
+        raise HTTPException(502, "Could not create payment request")
+    return {
+        "ok": True,
+        "payment_request_id": record["id"],
+        "payment_type": body.payment_type,
+        "amount_ton": record["amount_nano"] / 1_000_000_000,
+        "amount_nano": record["amount_nano"],
+        "destination_address": PAYMENT_WALLET,
+        "expires_in": PAYMENT_WINDOW_SECONDS,
+        "created_at": iso_z(now),
+        "expires_at": iso_z(expires),
+        "server_time": iso_z(utcnow()),
+    }
 
-    return {"ok": True, "verified": True, "payment_type": body.payment_type,
-            "amount_nano": paid_nano, "telegram_user_id": user_id,
-            "note": "Claim recorded only; miner activation/token crediting is not implemented."}
+
+@app.post("/verify-payment")
+async def verify_payment(body: VerifyRequest):
+    user_id = validate_init_data(body.init_data)
+    request_id = str(body.payment_request_id)
+    submitted_hash = normalize_tx_hash(body.tx_hash)
+
+    req = await get_payment_request(request_id)
+    if not req or req.get("telegram_user_id") != user_id:
+        raise HTTPException(404, "Payment request not found")
+    if req["status"] == "expired":
+        raise HTTPException(410, "Payment request expired. Create a new payment request.")
+    if req["status"] != "pending":
+        raise HTTPException(409, "Payment request already used")
+
+    try:
+        created_at, expires_at = parse_ts(req["created_at"]), parse_ts(req["expires_at"])
+    except Exception:
+        raise HTTPException(500, "Stored payment request has invalid timestamps")
+    if utcnow() > expires_at:
+        await set_request_status(request_id, "expired")
+        raise HTTPException(410, "Payment request expired. Create a new payment request.")
+
+    if not PAYMENT_WALLET:
+        raise HTTPException(500, "PAYMENT_WALLET is not configured")
+    try:
+        parse_ton_address(PAYMENT_WALLET)
+    except ValueError:
+        raise HTTPException(500, "PAYMENT_WALLET is not a valid TON address")
+
+    # TON wallets commonly show the sender-side transaction hash. Resolve its trace,
+    # then identify exactly one successful incoming transfer to the STORM wallet.
+    trace = await fetch_trace(submitted_hash)
+    matches = []
+    for tx in tx_candidates(trace):
+        in_msg = tx.get("in_msg")
+        if not isinstance(in_msg, dict):
+            continue
+        if tx.get("aborted") is True or tx.get("success") is not True:
+            continue
+        if in_msg.get("msg_type") != "int_msg" or in_msg.get("bounced") is True:
+            continue
+        dest = addr_str(in_msg.get("destination"))
+        acct = addr_str(tx.get("account"))
+        if not same_address(dest, PAYMENT_WALLET):
+            continue
+        if acct is not None and not same_address(acct, PAYMENT_WALLET):
+            continue
+        try:
+            paid_nano = int(in_msg.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if paid_nano != int(req["amount_nano"]):
+            continue
+        utime = tx.get("utime")
+        if isinstance(utime, bool) or not isinstance(utime, int):
+            continue
+        if not (int(created_at.timestamp()) <= utime <= int(expires_at.timestamp())):
+            continue
+        canonical_hash = str(tx.get("hash") or "").lower()
+        if HEX64.match(canonical_hash):
+            matches.append((tx, in_msg, canonical_hash, paid_nano))
+
+    # Never guess if one sender transaction contains multiple matching transfers.
+    unique = {item[2]: item for item in matches}
+    if not unique:
+        raise HTTPException(400, "No successful payment with the exact amount to the STORM wallet was found within 4 minutes")
+    if len(unique) != 1:
+        raise HTTPException(400, "More than one matching payment was found; contact support")
+
+    tx, in_msg, tx_hash, paid_nano = next(iter(unique.values()))
+    sender = addr_str(in_msg.get("source"))
+    claim = await sb("POST", "rpc/claim_payment_request", prefer=None, body={
+        "p_request_id": request_id,
+        "p_telegram_user_id": user_id,
+        "p_tx_hash": tx_hash,
+        "p_sender_address": sender,
+    })
+    if claim.status_code != 200:
+        logger.error("claim rpc failed: %s %s", claim.status_code, claim.text[:300])
+        raise HTTPException(502, "Could not save payment claim")
+    result = claim.json()
+    if not result.get("ok"):
+        if result.get("reason") == "tx_already_claimed":
+            raise HTTPException(409, "This transaction hash has already been used")
+        raise HTTPException(409, "Payment request was already used")
+
+    return {
+        "ok": True,
+        "verified": True,
+        "payment_request_id": request_id,
+        "payment_type": req["payment_type"],
+        "amount_nano": paid_nano,
+        "telegram_user_id": user_id,
+        "tx_hash": tx_hash,
+        "submitted_hash": submitted_hash,
+    }
