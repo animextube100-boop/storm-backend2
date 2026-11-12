@@ -26,6 +26,8 @@ app = FastAPI(title="STORM Payment Verification API")
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").rstrip("/")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "")
 TONAPI_BASE_URL = os.getenv(
     "TONAPI_BASE_URL", "https://tonapi.io"
@@ -400,6 +402,83 @@ def normalize_tx_hash(raw: str) -> str:
     )
 
 
+
+# ------------------------------------------------------- TELEGRAM BOT API ---
+
+async def telegram_api(method: str, payload: dict):
+    if not BOT_TOKEN:
+        raise HTTPException(500, "BOT_TOKEN is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                json=payload,
+            )
+    except httpx.HTTPError:
+        raise HTTPException(503, "Telegram service is temporarily unavailable")
+    if response.status_code != 200 or not response.json().get("ok"):
+        logger.error("Telegram %s failed: %s", method, response.text[:500])
+        raise HTTPException(502, f"Telegram {method} failed")
+    return response.json().get("result")
+
+
+async def notify_admin(req: dict, username: str | None, tx_hash: str):
+    if not ADMIN_TELEGRAM_ID:
+        raise HTTPException(500, "ADMIN_TELEGRAM_ID is not configured")
+    amount_ton = int(req["amount_nano"]) / 1_000_000_000
+    username_text = f"@{username}" if username else "(not provided)"
+    message = (
+        "⚡ STORM PAYMENT REQUEST\\n\\n"
+        f"User ID: {req['telegram_user_id']}\\n"
+        f"Username: {username_text}\\n"
+        f"Payment type: {req['payment_type']}\\n"
+        f"Amount: {amount_ton:g} TON\\n"
+        f"Transaction hash:\\n<code>{tx_hash}</code>\\n"
+        f"Request ID: <code>{req['id']}</code>\\n"
+        f"Submitted: {iso_z(utcnow())}\\n\\n"
+        "Check the payment in your wallet/explorer before approving."
+    )
+    return await telegram_api("sendMessage", {
+        "chat_id": ADMIN_TELEGRAM_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "✅ Confirm", "callback_data": f"storm:approve:{req['id']}"},
+                {"text": "❌ Reject", "callback_data": f"storm:reject:{req['id']}"},
+            ]]
+        },
+    })
+
+
+async def send_user_status(user_id: str, approved: bool, payment_type: str):
+    status = "approved" if approved else "rejected"
+    message = (
+        f"✅ Your STORM {payment_type} payment has been approved."
+        if approved else
+        f"❌ Your STORM {payment_type} payment was rejected. Please contact support if you think this is a mistake."
+    )
+    try:
+        await telegram_api("sendMessage", {"chat_id": user_id, "text": message})
+    except HTTPException:
+        logger.exception("Could not notify user %s about %s payment", user_id, status)
+
+
+async def update_payment_status(request_id: str, status: str):
+    result = await sb(
+        "PATCH",
+        "payment_requests",
+        params={"id": f"eq.{request_id}", "status": "eq.pending"},
+        body={"status": status},
+        prefer="return=representation",
+    )
+    if result.status_code not in (200, 204):
+        logger.error("Payment status update failed: %s %s", result.status_code, result.text[:300])
+        raise HTTPException(502, "Could not update payment status")
+    rows = result.json() if result.content else []
+    return rows[0] if rows else None
+
+
 # -------------------------------------------------------------- ENDPOINTS ---
 
 @app.get("/health")
@@ -494,6 +573,7 @@ async def create_payment(body: CreatePaymentRequest):
     }
 
 
+
 @app.post("/verify-payment")
 async def verify_payment(body: VerifyRequest):
     user_id = validate_init_data(body.init_data)
@@ -501,165 +581,160 @@ async def verify_payment(body: VerifyRequest):
     submitted_hash = normalize_tx_hash(body.tx_hash)
 
     req = await get_payment_request(request_id)
-
     if not req or req.get("telegram_user_id") != user_id:
         raise HTTPException(404, "Payment request not found")
+    if req.get("status") != "pending":
+        raise HTTPException(409, "Payment request already submitted")
 
-    if req["status"] == "expired":
-        raise HTTPException(
-            410, "Payment request expired. Create a new payment request."
-        )
-
-    if req["status"] != "pending":
-        raise HTTPException(409, "Payment request already used")
-
+    # Store the hash and move it to manual-review status. No TONAPI check is performed.
     try:
-        created_at = parse_ts(req["created_at"])
-        expires_at = parse_ts(req["expires_at"])
+        init_values = dict(parse_qsl(body.init_data, keep_blank_values=True))
+        user_data = json.loads(init_values.get("user", "{}"))
+        username = user_data.get("username")
     except Exception:
-        raise HTTPException(
-            500, "Stored payment request has invalid timestamps"
-        )
+        username = None
 
-    if utcnow() > expires_at:
-        await set_request_status(request_id, "expired")
-        raise HTTPException(
-            410, "Payment request expired. Create a new payment request."
-        )
-
-    if not PAYMENT_WALLET:
-        raise HTTPException(500, "PAYMENT_WALLET is not configured")
-
-    try:
-        parse_ton_address(PAYMENT_WALLET)
-    except ValueError:
-        raise HTTPException(
-            500, "PAYMENT_WALLET is not a valid TON address"
-        )
-
-    # Resolve the sender-side wallet hash to its TON trace.
-    trace = await fetch_trace(submitted_hash)
-
-    matches = []
-
-    for tx in tx_candidates(trace):
-        in_msg = tx.get("in_msg")
-
-        if not isinstance(in_msg, dict):
-            continue
-
-        if tx.get("aborted") is True or tx.get("success") is not True:
-            continue
-
-        if (
-            in_msg.get("msg_type") != "int_msg"
-            or in_msg.get("bounced") is True
-        ):
-            continue
-
-        destination = addr_str(in_msg.get("destination"))
-        account = addr_str(tx.get("account"))
-
-        if not same_address(destination, PAYMENT_WALLET):
-            continue
-
-        if account is not None and not same_address(
-            account, PAYMENT_WALLET
-        ):
-            continue
-
-        try:
-            paid_nano = int(in_msg.get("value"))
-        except (TypeError, ValueError):
-            continue
-
-        if paid_nano != int(req["amount_nano"]):
-            continue
-
-        utime = tx.get("utime")
-
-        if isinstance(utime, bool) or not isinstance(utime, int):
-            continue
-
-        if not (
-            int(created_at.timestamp())
-            <= utime
-            <= int(expires_at.timestamp())
-        ):
-            continue
-
-        canonical_hash = str(tx.get("hash") or "").lower()
-
-        if HEX64.match(canonical_hash):
-            matches.append(
-                (tx, in_msg, canonical_hash, paid_nano)
-            )
-
-    unique = {
-        item[2]: item
-        for item in matches
-    }
-
-    if not unique:
-        raise HTTPException(
-            400,
-            "No successful payment with the exact amount to the STORM wallet was found within 4 minutes",
-        )
-
-    if len(unique) != 1:
-        raise HTTPException(
-            400,
-            "More than one matching payment was found; contact support",
-        )
-
-    tx, in_msg, tx_hash, paid_nano = next(
-        iter(unique.values())
-    )
-
-    sender = addr_str(in_msg.get("source"))
-
-    # Supabase atomically marks the request verified and claims the hash once.
-    claim = await sb(
-        "POST",
-        "rpc/claim_payment_request",
-        prefer=None,
+    updated = await sb(
+        "PATCH",
+        "payment_requests",
+        params={"id": f"eq.{request_id}", "status": "eq.pending"},
         body={
-            "p_request_id": request_id,
-            "p_telegram_user_id": user_id,
-            "p_tx_hash": tx_hash,
-            "p_sender_address": sender,
+            "status": "awaiting_admin",
+            "tx_hash": submitted_hash,
+            "telegram_username": username,
         },
+        prefer="return=representation",
     )
+    if updated.status_code not in (200, 204):
+        logger.error("Could not save submitted hash: %s %s", updated.status_code, updated.text[:300])
+        raise HTTPException(502, "Could not submit payment for admin review")
+    rows = updated.json() if updated.content else []
+    if not rows:
+        raise HTTPException(409, "Payment request has already been submitted")
 
-    if claim.status_code != 200:
-        logger.error(
-            "claim rpc failed: %s %s",
-            claim.status_code,
-            claim.text[:300],
-        )
-        raise HTTPException(
-            502, "Could not save payment claim"
-        )
-
-    result = claim.json()
-
-    if not result.get("ok"):
-        if result.get("reason") == "tx_already_claimed":
-            raise HTTPException(
-                409, "This transaction hash has already been used"
-            )
-
-        raise HTTPException(
-            409, "Payment request was already used"
-        )
+    req.update({"tx_hash": submitted_hash, "telegram_username": username, "status": "awaiting_admin"})
+    try:
+        await notify_admin(req, username, submitted_hash)
+    except Exception:
+        # Keep the request pending for review; the admin can inspect/retry after fixing bot configuration.
+        logger.exception("Admin notification failed for payment request %s", request_id)
+        raise
 
     return {
         "ok": True,
-        "verified": True,
+        "verified": False,
+        "pending": True,
+        "status": "awaiting_admin",
         "payment_request_id": request_id,
         "payment_type": req["payment_type"],
-        "amount_nano": paid_nano,
         "telegram_user_id": user_id,
-        "tx_hash": tx_hash,
-        "submitted_hash": submitted_hash,
+        "message": "Transaction hash submitted. Waiting for admin approval.",
     }
+
+
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    if not TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(500, "TELEGRAM_WEBHOOK_SECRET is not configured")
+    supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(supplied_secret, TELEGRAM_WEBHOOK_SECRET):
+        raise HTTPException(403, "Invalid webhook secret")
+
+    update = await request.json()
+    callback = update.get("callback_query")
+    if not callback:
+        return {"ok": True}
+
+    callback_id = callback.get("id", "")
+    actor_id = str(callback.get("from", {}).get("id", ""))
+    data = callback.get("data", "")
+    if actor_id != ADMIN_TELEGRAM_ID:
+        await telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "You are not authorized to approve payments.",
+            "show_alert": True,
+        })
+        return {"ok": True}
+
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "storm" or parts[1] not in ("approve", "reject"):
+        await telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Invalid action."})
+        return {"ok": True}
+
+    action, request_id = parts[1], parts[2]
+    req = await get_payment_request(request_id)
+    if not req or req.get("status") != "awaiting_admin":
+        await telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "This request has already been handled or cannot be found.",
+            "show_alert": True,
+        })
+        return {"ok": True}
+
+    if action == "approve":
+        # Unique tx_hash constraint in payment_claims prevents reuse.
+        claim = await sb(
+            "POST",
+            "payment_claims",
+            body={
+                "tx_hash": req["tx_hash"],
+                "telegram_user_id": req["telegram_user_id"],
+                "payment_type": req["payment_type"],
+                "amount_nano": req["amount_nano"],
+                "sender_address": None,
+                "destination_address": req["destination_address"],
+            },
+            prefer="return=minimal",
+        )
+        if claim.status_code not in (200, 201, 204):
+            if claim.status_code == 409:
+                await telegram_api("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "This transaction hash has already been used.",
+                    "show_alert": True,
+                })
+                return {"ok": True}
+            logger.error("Could not claim approved hash: %s %s", claim.status_code, claim.text[:300])
+            raise HTTPException(502, "Could not record approved transaction hash")
+        final_status = "approved"
+    else:
+        final_status = "rejected"
+
+    changed = await sb(
+        "PATCH",
+        "payment_requests",
+        params={"id": f"eq.{request_id}", "status": "eq.awaiting_admin"},
+        body={"status": final_status},
+        prefer="return=representation",
+    )
+    if changed.status_code not in (200, 204):
+        raise HTTPException(502, "Could not save admin decision")
+    changed_rows = changed.json() if changed.content else []
+    if not changed_rows:
+        await telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "This request was already handled.",
+            "show_alert": True,
+        })
+        return {"ok": True}
+
+    await telegram_api("answerCallbackQuery", {
+        "callback_query_id": callback_id,
+        "text": f"Payment {final_status}.",
+    })
+    msg = callback.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    if chat_id and message_id:
+        await telegram_api("editMessageReplyMarkup", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": {"inline_keyboard": []},
+        })
+        await telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"Payment request {request_id} has been {final_status.upper()}."
+        })
+
+    await send_user_status(req["telegram_user_id"], action == "approve", req["payment_type"])
+    return {"ok": True}
