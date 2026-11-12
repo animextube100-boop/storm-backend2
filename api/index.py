@@ -106,6 +106,10 @@ class VerifyRequest(BaseModel):
     payment_request_id: uuid.UUID
 
 
+class PaymentStatusRequest(BaseModel):
+    init_data: str = Field(min_length=1, max_length=8192)
+
+
 # ---------------------------------------------------------- TELEGRAM ---
 
 def validate_init_data(raw: str) -> str:
@@ -429,14 +433,14 @@ async def notify_admin(req: dict, username: str | None, tx_hash: str):
     amount_ton = int(req["amount_nano"]) / 1_000_000_000
     username_text = f"@{username}" if username else "(not provided)"
     message = (
-        "⚡ STORM PAYMENT REQUEST\\n\\n"
-        f"User ID: {req['telegram_user_id']}\\n"
-        f"Username: {username_text}\\n"
-        f"Payment type: {req['payment_type']}\\n"
-        f"Amount: {amount_ton:g} TON\\n"
-        f"Transaction hash:\\n<code>{tx_hash}</code>\\n"
-        f"Request ID: <code>{req['id']}</code>\\n"
-        f"Submitted: {iso_z(utcnow())}\\n\\n"
+        "⚡ STORM PAYMENT REQUEST\n\n"
+        f"User ID: {req['telegram_user_id']}\n"
+        f"Username: {username_text}\n"
+        f"Payment type: {req['payment_type']}\n"
+        f"Amount: {amount_ton:g} TON\n"
+        f"Transaction hash:\n<code>{tx_hash}</code>\n"
+        f"Request ID: <code>{req['id']}</code>\n"
+        f"Submitted: {iso_z(utcnow())}\n\n"
         "Check the payment in your wallet/explorer before approving."
     )
     return await telegram_api("sendMessage", {
@@ -575,6 +579,43 @@ async def create_payment(body: CreatePaymentRequest):
 
 
 
+@app.post("/payment-status")
+async def payment_status(body: PaymentStatusRequest):
+    """Return only this Telegram user's payment requests and approved entitlements."""
+    user_id = validate_init_data(body.init_data)
+    result = await sb(
+        "GET",
+        "payment_requests",
+        params={
+            "telegram_user_id": f"eq.{user_id}",
+            "select": "id,payment_type,amount_nano,status,tx_hash,created_at",
+            "order": "created_at.desc",
+            "limit": "200",
+        },
+    )
+    if result.status_code != 200:
+        logger.error("Payment status lookup failed: %s %s", result.status_code, result.text[:300])
+        raise HTTPException(502, "Could not load payment status")
+
+    payments = [
+        {
+            "payment_request_id": row["id"],
+            "payment_type": row["payment_type"],
+            "amount_nano": int(row["amount_nano"]),
+            "status": row["status"],
+            "tx_hash": row.get("tx_hash"),
+            "created_at": row.get("created_at"),
+        }
+        for row in result.json()
+        if row.get("tx_hash") or row.get("status") in ("awaiting_admin", "approved", "rejected")
+    ]
+    verified = any(
+        p["payment_type"] == "verification" and p["status"] in ("approved", "verified")
+        for p in payments
+    )
+    return {"ok": True, "verified": verified, "payments": payments}
+
+
 @app.post("/verify-payment")
 async def verify_payment(body: VerifyRequest):
     user_id = validate_init_data(body.init_data)
@@ -586,6 +627,11 @@ async def verify_payment(body: VerifyRequest):
         raise HTTPException(404, "Payment request not found")
     if req.get("status") != "pending":
         raise HTTPException(409, "Payment request already submitted")
+    try:
+        if utcnow() > parse_ts(req["expires_at"]):
+            raise HTTPException(410, "The 4-minute payment window expired. Create a new request.")
+    except KeyError:
+        raise HTTPException(500, "Payment request expiry is missing")
 
     # Store the hash and move it to manual-review status. No TONAPI check is performed.
     try:
@@ -606,6 +652,8 @@ async def verify_payment(body: VerifyRequest):
         },
         prefer="return=representation",
     )
+    if updated.status_code == 409:
+        raise HTTPException(409, "This transaction hash has already been submitted.")
     if updated.status_code not in (200, 204):
         logger.error("Could not save submitted hash: %s %s", updated.status_code, updated.text[:300])
         raise HTTPException(502, "Could not submit payment for admin review")
@@ -617,9 +665,16 @@ async def verify_payment(body: VerifyRequest):
     try:
         await notify_admin(req, username, submitted_hash)
     except Exception:
-        # Keep the request pending for review; the admin can inspect/retry after fixing bot configuration.
         logger.exception("Admin notification failed for payment request %s", request_id)
-        raise
+        # Release the request so the user can resubmit after the admin-bot issue is fixed.
+        await sb(
+            "PATCH",
+            "payment_requests",
+            params={"id": f"eq.{request_id}", "status": "eq.awaiting_admin"},
+            body={"status": "pending", "tx_hash": None, "telegram_username": None},
+            prefer="return=minimal",
+        )
+        raise HTTPException(503, "Could not notify the admin bot. Please try submitting again shortly.")
 
     return {
         "ok": True,
@@ -629,6 +684,7 @@ async def verify_payment(body: VerifyRequest):
         "payment_request_id": request_id,
         "payment_type": req["payment_type"],
         "telegram_user_id": user_id,
+        "tx_hash": submitted_hash,
         "message": "Transaction hash submitted. Waiting for admin approval.",
     }
 
