@@ -25,7 +25,8 @@ app = FastAPI(title="STORM Payment Verification API")
 # ------------------------------------------------------------- CONFIG ---
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").rstrip("/")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MINI_APP_BOT_TOKEN = os.getenv("MINI_APP_BOT_TOKEN", "")
+ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "")
@@ -108,8 +109,8 @@ class VerifyRequest(BaseModel):
 # ---------------------------------------------------------- TELEGRAM ---
 
 def validate_init_data(raw: str) -> str:
-    if not BOT_TOKEN:
-        raise HTTPException(500, "BOT_TOKEN is not configured")
+    if not MINI_APP_BOT_TOKEN:
+        raise HTTPException(500, "MINI_APP_BOT_TOKEN is not configured")
 
     try:
         values = dict(parse_qsl(raw, keep_blank_values=True))
@@ -127,7 +128,7 @@ def validate_init_data(raw: str) -> str:
 
     secret = hmac.new(
         b"WebAppData",
-        BOT_TOKEN.encode(),
+        MINI_APP_BOT_TOKEN.encode(),
         hashlib.sha256,
     ).digest()
 
@@ -406,12 +407,12 @@ def normalize_tx_hash(raw: str) -> str:
 # ------------------------------------------------------- TELEGRAM BOT API ---
 
 async def telegram_api(method: str, payload: dict):
-    if not BOT_TOKEN:
-        raise HTTPException(500, "BOT_TOKEN is not configured")
+    if not ADMIN_BOT_TOKEN:
+        raise HTTPException(500, "ADMIN_BOT_TOKEN is not configured")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/{method}",
                 json=payload,
             )
     except httpx.HTTPError:
