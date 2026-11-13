@@ -110,6 +110,12 @@ class PaymentStatusRequest(BaseModel):
     init_data: str = Field(min_length=1, max_length=8192)
 
 
+class CreateWithdrawalRequest(BaseModel):
+    init_data: str = Field(min_length=1, max_length=8192)
+    amount: float = Field(ge=3000, le=1000000000)
+    wallet_address: str = Field(min_length=24, max_length=128)
+
+
 # ---------------------------------------------------------- TELEGRAM ---
 
 def validate_init_data(raw: str) -> str:
@@ -484,6 +490,57 @@ async def update_payment_status(request_id: str, status: str):
     return rows[0] if rows else None
 
 
+async def get_withdrawal_request(request_id: str):
+    r = await sb(
+        "GET",
+        "withdrawal_requests",
+        params={"id": f"eq.{request_id}", "select": "*", "limit": "1"},
+    )
+    if r.status_code != 200:
+        raise HTTPException(502, "Could not read withdrawal request")
+    rows = r.json()
+    return rows[0] if rows else None
+
+
+async def notify_admin_withdrawal(req: dict):
+    if not ADMIN_TELEGRAM_ID:
+        raise HTTPException(500, "ADMIN_TELEGRAM_ID is not configured")
+    username = f"@{req['telegram_username']}" if req.get("telegram_username") else "(not provided)"
+    message = (
+        "⚡ STORM WITHDRAWAL REQUEST\n\n"
+        f"User ID: {req['telegram_user_id']}\n"
+        f"Username: {username}\n"
+        f"Requested: {float(req['gross_amount']):,.3f} STORM\n"
+        f"Fee: {float(req['fee_amount']):,.3f} STORM\n"
+        f"Net payout: {float(req['payout_amount']):,.3f} STORM\n"
+        f"TON wallet: <code>{req['wallet_address']}</code>\n"
+        f"Request ID: <code>{req['id']}</code>\n"
+        f"Submitted: {iso_z(utcnow())}\n\n"
+        "Verify the user's balance and miner eligibility. Send the net STORM payout manually, then press Confirm."
+    )
+    return await telegram_api("sendMessage", {
+        "chat_id": ADMIN_TELEGRAM_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "reply_markup": {"inline_keyboard": [[
+            {"text": "✅ Confirm", "callback_data": f"stormwd:approve:{req['id']}"},
+            {"text": "❌ Reject", "callback_data": f"stormwd:reject:{req['id']}"},
+        ]]},
+    })
+
+
+async def send_withdrawal_status(user_id: str, approved: bool, payout_amount: float):
+    message = (
+        f"✅ Your STORM withdrawal was approved. Net payout: {payout_amount:,.3f} STORM."
+        if approved else
+        "❌ Your STORM withdrawal was rejected. The requested amount has been returned to your in-app balance."
+    )
+    try:
+        await telegram_api("sendMessage", {"chat_id": user_id, "text": message})
+    except HTTPException:
+        logger.exception("Could not notify user %s about withdrawal decision", user_id)
+
+
 # -------------------------------------------------------------- ENDPOINTS ---
 
 @app.get("/health")
@@ -616,6 +673,129 @@ async def payment_status(body: PaymentStatusRequest):
     return {"ok": True, "verified": verified, "payments": payments}
 
 
+@app.post("/create-withdrawal")
+async def create_withdrawal(body: CreateWithdrawalRequest):
+    user_id = validate_init_data(body.init_data)
+    amount = round(float(body.amount), 3)
+    fee = 200.0
+    payout = round(amount - fee, 3)
+    if amount < 3000 or payout <= 0:
+        raise HTTPException(400, "Minimum withdrawal is 3000 STORM and the fee is 200 STORM")
+
+    try:
+        parse_ton_address(body.wallet_address)
+    except ValueError:
+        raise HTTPException(400, "Enter a valid TON wallet address")
+
+    # Only a miner payment approved in the server-side payment table qualifies.
+    miners = await sb(
+        "GET",
+        "payment_requests",
+        params={
+            "telegram_user_id": f"eq.{user_id}",
+            "payment_type": "in.(basic,advanced,pro,ultra,legendary)",
+            "status": "in.(approved,verified)",
+            "select": "id",
+            "limit": "1",
+        },
+    )
+    if miners.status_code != 200:
+        raise HTTPException(502, "Could not verify miner ownership")
+    if not miners.json():
+        raise HTTPException(403, "At least one approved miner purchase is required")
+
+    pending = await sb(
+        "GET",
+        "withdrawal_requests",
+        params={
+            "telegram_user_id": f"eq.{user_id}",
+            "status": "eq.awaiting_admin",
+            "select": "id",
+            "limit": "1",
+        },
+    )
+    if pending.status_code != 200:
+        raise HTTPException(502, "Could not check pending withdrawals")
+    if pending.json():
+        raise HTTPException(409, "You already have a withdrawal request awaiting admin review")
+
+    try:
+        values = dict(parse_qsl(body.init_data, keep_blank_values=True))
+        user_data = json.loads(values.get("user", "{}"))
+        username = user_data.get("username")
+    except Exception:
+        username = None
+
+    request_id = str(uuid.uuid4())
+    record = {
+        "id": request_id,
+        "telegram_user_id": user_id,
+        "telegram_username": username,
+        "gross_amount": amount,
+        "fee_amount": fee,
+        "payout_amount": payout,
+        "wallet_address": body.wallet_address.strip(),
+        "status": "awaiting_admin",
+        "created_at": iso_z(utcnow()),
+    }
+    saved = await sb("POST", "withdrawal_requests", body=record)
+    if saved.status_code not in (200, 201):
+        logger.error("Withdrawal insert failed: %s %s", saved.status_code, saved.text[:300])
+        if saved.status_code == 409:
+            raise HTTPException(409, "You already have a withdrawal request awaiting admin review")
+        raise HTTPException(502, "Could not save withdrawal request")
+
+    try:
+        await notify_admin_withdrawal(record)
+    except Exception:
+        logger.exception("Admin notification failed for withdrawal %s", request_id)
+        await sb(
+            "PATCH", "withdrawal_requests",
+            params={"id": f"eq.{request_id}", "status": "eq.awaiting_admin"},
+            body={"status": "notification_failed"},
+            prefer="return=minimal",
+        )
+        raise HTTPException(503, "Could not notify the admin bot. Please try again shortly.")
+
+    return {
+        "ok": True,
+        "withdrawal_request_id": request_id,
+        "gross_amount": amount,
+        "fee_amount": fee,
+        "payout_amount": payout,
+        "status": "awaiting_admin",
+    }
+
+
+@app.post("/withdrawal-status")
+async def withdrawal_status(body: PaymentStatusRequest):
+    user_id = validate_init_data(body.init_data)
+    result = await sb(
+        "GET",
+        "withdrawal_requests",
+        params={
+            "telegram_user_id": f"eq.{user_id}",
+            "status": "in.(awaiting_admin,approved,rejected)",
+            "select": "id,gross_amount,fee_amount,payout_amount,wallet_address,status,created_at,decided_at",
+            "order": "created_at.desc",
+            "limit": "100",
+        },
+    )
+    if result.status_code != 200:
+        raise HTTPException(502, "Could not load withdrawal status")
+    withdrawals = [{
+        "withdrawal_request_id": row["id"],
+        "gross_amount": float(row["gross_amount"]),
+        "fee_amount": float(row["fee_amount"]),
+        "payout_amount": float(row["payout_amount"]),
+        "wallet_address": row["wallet_address"],
+        "status": row["status"],
+        "created_at": row.get("created_at"),
+        "decided_at": row.get("decided_at"),
+    } for row in result.json()]
+    return {"ok": True, "withdrawals": withdrawals}
+
+
 @app.post("/verify-payment")
 async def verify_payment(body: VerifyRequest):
     user_id = validate_init_data(body.init_data)
@@ -714,6 +894,57 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     parts = data.split(":")
+    if len(parts) == 3 and parts[0] == "stormwd" and parts[1] in ("approve", "reject"):
+        action, request_id = parts[1], parts[2]
+        req = await get_withdrawal_request(request_id)
+        if not req or req.get("status") != "awaiting_admin":
+            await telegram_api("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": "This withdrawal has already been handled or cannot be found.",
+                "show_alert": True,
+            })
+            return {"ok": True}
+
+        final_status = "approved" if action == "approve" else "rejected"
+        changed = await sb(
+            "PATCH", "withdrawal_requests",
+            params={"id": f"eq.{request_id}", "status": "eq.awaiting_admin"},
+            body={"status": final_status, "decided_at": iso_z(utcnow())},
+            prefer="return=representation",
+        )
+        if changed.status_code not in (200, 204):
+            raise HTTPException(502, "Could not save withdrawal decision")
+        rows = changed.json() if changed.content else []
+        if not rows:
+            await telegram_api("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": "This withdrawal was already handled.",
+                "show_alert": True,
+            })
+            return {"ok": True}
+
+        await telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": f"Withdrawal {final_status}.",
+        })
+        msg = callback.get("message", {})
+        chat_id = msg.get("chat", {}).get("id")
+        message_id = msg.get("message_id")
+        if chat_id and message_id:
+            await telegram_api("editMessageReplyMarkup", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []},
+            })
+            await telegram_api("sendMessage", {
+                "chat_id": chat_id,
+                "text": f"Withdrawal request {request_id} has been {final_status.upper()}."
+            })
+        await send_withdrawal_status(
+            req["telegram_user_id"], action == "approve", float(req["payout_amount"])
+        )
+        return {"ok": True}
+
     if len(parts) != 3 or parts[0] != "storm" or parts[1] not in ("approve", "reject"):
         await telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Invalid action."})
         return {"ok": True}
