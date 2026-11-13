@@ -1,26 +1,32 @@
-# STORM payment verification backend (initial scaffold)
+# STORM Mining Frontend
 
-## Deploy
-1. Upload the contents of this ZIP to the root of your separate private GitHub repository.
-2. Import that repository into Vercel as a new project.
-3. Add the environment variables below in Vercel → Settings → Environment Variables.
-4. Redeploy after adding them.
+This is a Vite-based, multi-file frontend conversion of the supplied STORM HTML app.
+The existing DOM-driven application logic and its UI controller scripts are preserved
+in `src/main.js`; the original stylesheet is in `src/styles.css`; page markup is in
+`index.html`. This is intentionally a low-risk modular migration rather than a full
+React rewrite, because the existing app relies heavily on direct DOM updates and
+global handlers.
 
-## Environment variables
-- BOT_TOKEN: Telegram bot token (secret).
-- TONAPI_KEY: TONAPI API key.
-- SUPABASE_URL: https://fntgxukftaumztacprwe.supabase.co
-- SUPABASE_SECRET_KEY: your Supabase server-side secret key (sb_secret_...).
-- PAYMENT_WALLET: UQCo0-D4DWT4Q99BJ35ONA7wduh_qtNwwpni55UyMhsFcY-x
-- FRONTEND_ORIGIN: exact frontend deployment origin, with no trailing slash.
+## Local development
+1. Install Node.js (LTS).
+2. Run `npm install`.
+3. Run `npm run dev`.
 
-## Test
-Open https://YOUR-BACKEND.vercel.app/health. Expected:
-{"ok":true,"service":"storm-payment-verification"}
+## Production build
+Run `npm run build`. Vite creates the deployable site in `dist/`.
 
-## Important limitations
-This is an initial scaffold, not a production-ready payment-crediting system.
-- Destination matching is exact. TONAPI may return a raw address while your configured wallet is friendly-format, so a valid payment may be rejected until address normalization is added and tested.
-- A shared receiving wallet plus transaction hash does not prove which Telegram user made the payment. Use unique memo/order attribution or authenticated wallet ownership before production.
-- This endpoint records a verified claim only. It does not activate miners or credit STORM.
-- Do not use mainnet payments for testing until end-to-end checks are complete. Never put secrets in frontend HTML or GitHub.
+## Vercel
+- Framework Preset: Vite
+- Root Directory: `./`
+- Build Command: `npm run build`
+- Output Directory: `dist`
+
+Keep the existing backend deployment and environment variables unchanged.
+The frontend continues to call the backend configured in its existing app code.
+
+## Changes included
+- Withdrawal verified-referral requirement: 0.
+- Withdrawal minimum remains 5,000 STORM.
+- Withdrawal fee remains 300 STORM.
+- Referral progress now says no referrals are required (no divide-by-zero).
+- Referral invite URL uses `@Mine_STORM_bot`.
