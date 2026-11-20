@@ -1,6 +1,5 @@
 
 import os
-import asyncio
 import re
 import hmac
 import hashlib
@@ -542,76 +541,6 @@ async def send_withdrawal_status(user_id: str, approved: bool, payout_amount: fl
         logger.exception("Could not notify user %s about withdrawal decision", user_id)
 
 
-# ---------------------------------------------------------- ADMIN BROADCAST ---
-
-# In-memory draft is intentionally short-lived; it is created and confirmed by
-# the configured admin only. A redeploy clears any unconfirmed draft.
-BROADCAST_DRAFT = None
-BROADCAST_PAGE_SIZE = 1000
-
-
-async def get_broadcast_recipients() -> list[str]:
-    """Return unique Telegram IDs recorded in either request table."""
-    recipients = set()
-    for table in ("payment_requests", "withdrawal_requests"):
-        offset = 0
-        while True:
-            result = await sb(
-                "GET", table,
-                params={
-                    "select": "telegram_user_id",
-                    "order": "telegram_user_id.asc",
-                    "limit": str(BROADCAST_PAGE_SIZE),
-                    "offset": str(offset),
-                },
-            )
-            if result.status_code != 200:
-                logger.error("Could not load broadcast recipients from %s: %s", table, result.text[:300])
-                raise HTTPException(502, f"Could not load users from {table}")
-            rows = result.json()
-            for row in rows:
-                value = row.get("telegram_user_id")
-                if value is not None and str(value).strip():
-                    recipients.add(str(value).strip())
-            if len(rows) < BROADCAST_PAGE_SIZE:
-                break
-            offset += len(rows)
-    recipients.discard(str(ADMIN_TELEGRAM_ID))
-    return sorted(recipients)
-
-
-async def copy_admin_message_to_user(client: httpx.AsyncClient, source_chat_id: str, message_id: int, user_id: str) -> bool:
-    try:
-        response = await client.post(
-            f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/copyMessage",
-            json={
-                "chat_id": user_id,
-                "from_chat_id": source_chat_id,
-                "message_id": message_id,
-            },
-        )
-        data = response.json()
-        return response.status_code == 200 and bool(data.get("ok"))
-    except Exception:
-        logger.exception("Broadcast delivery failed for Telegram user %s", user_id)
-        return False
-
-
-async def run_broadcast(source_chat_id: str, message_id: int) -> tuple[int, int, int]:
-    recipients = await get_broadcast_recipients()
-    sent = failed = 0
-    # Stay comfortably below Telegram's ordinary per-bot messaging limit.
-    async with httpx.AsyncClient(timeout=15) as client:
-        for index, user_id in enumerate(recipients):
-            if await copy_admin_message_to_user(client, source_chat_id, message_id, user_id):
-                sent += 1
-            else:
-                failed += 1
-            if index + 1 < len(recipients):
-                await asyncio.sleep(0.05)
-    return len(recipients), sent, failed
-
-
 # -------------------------------------------------------------- ENDPOINTS ---
 
 @app.get("/health")
@@ -942,7 +871,6 @@ async def verify_payment(body: VerifyRequest):
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    global BROADCAST_DRAFT
     if not TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(500, "TELEGRAM_WEBHOOK_SECRET is not configured")
     supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
@@ -950,51 +878,6 @@ async def telegram_webhook(request: Request):
         raise HTTPException(403, "Invalid webhook secret")
 
     update = await request.json()
-
-    # One-time admin broadcast flow: /broadcast -> send a message -> confirm.
-    incoming = update.get("message")
-    if incoming:
-        actor_id = str(incoming.get("from", {}).get("id", ""))
-        chat_id = str(incoming.get("chat", {}).get("id", ""))
-        message_text = incoming.get("text", "") or ""
-        if actor_id != ADMIN_TELEGRAM_ID:
-            return {"ok": True}
-        if message_text.split("@", 1)[0].strip().split()[0:1] == ["/broadcast"]:
-            BROADCAST_DRAFT = {"stage": "awaiting_message", "chat_id": chat_id}
-            await telegram_api("sendMessage", {
-                "chat_id": chat_id,
-                "text": "📢 Send the message you want to broadcast to all recorded STORM users. You can send text, a photo, video, or another Telegram message. Send /cancel to stop.",
-            })
-            return {"ok": True}
-        if message_text.strip().split("@", 1)[0] == "/cancel" and BROADCAST_DRAFT and BROADCAST_DRAFT.get("chat_id") == chat_id:
-            BROADCAST_DRAFT = None
-            await telegram_api("sendMessage", {"chat_id": chat_id, "text": "Broadcast cancelled."})
-            return {"ok": True}
-        if BROADCAST_DRAFT and BROADCAST_DRAFT.get("stage") == "awaiting_message" and BROADCAST_DRAFT.get("chat_id") == chat_id:
-            if message_text.startswith("/"):
-                await telegram_api("sendMessage", {"chat_id": chat_id, "text": "Please send the announcement itself, or /cancel."})
-                return {"ok": True}
-            BROADCAST_DRAFT = {
-                "stage": "ready",
-                "chat_id": chat_id,
-                "message_id": incoming.get("message_id"),
-            }
-            await telegram_api("copyMessage", {
-                "chat_id": chat_id,
-                "from_chat_id": chat_id,
-                "message_id": incoming.get("message_id"),
-            })
-            await telegram_api("sendMessage", {
-                "chat_id": chat_id,
-                "text": "Preview above. Send this message to all users recorded in payment_requests and withdrawal_requests?",
-                "reply_markup": {"inline_keyboard": [[
-                    {"text": "🚀 Send to all users", "callback_data": "stormbc:send"},
-                    {"text": "❌ Cancel", "callback_data": "stormbc:cancel"},
-                ]]},
-            })
-            return {"ok": True}
-        return {"ok": True}
-
     callback = update.get("callback_query")
     if not callback:
         return {"ok": True}
@@ -1002,53 +885,6 @@ async def telegram_webhook(request: Request):
     callback_id = callback.get("id", "")
     actor_id = str(callback.get("from", {}).get("id", ""))
     data = callback.get("data", "")
-
-    if data in ("stormbc:send", "stormbc:cancel"):
-        if actor_id != ADMIN_TELEGRAM_ID:
-            await telegram_api("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": "You are not authorized to run broadcasts.",
-                "show_alert": True,
-            })
-            return {"ok": True}
-        if not BROADCAST_DRAFT or BROADCAST_DRAFT.get("stage") != "ready":
-            await telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "No pending broadcast."})
-            return {"ok": True}
-        draft = BROADCAST_DRAFT
-        if data == "stormbc:cancel":
-            BROADCAST_DRAFT = None
-            await telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Broadcast cancelled."})
-            await telegram_api("editMessageReplyMarkup", {
-                "chat_id": draft["chat_id"],
-                "message_id": callback.get("message", {}).get("message_id"),
-                "reply_markup": {"inline_keyboard": []},
-            })
-            await telegram_api("sendMessage", {"chat_id": draft["chat_id"], "text": "Broadcast cancelled. No users were messaged."})
-            return {"ok": True}
-
-        # Consume the draft before sending to prevent a second click from duplicating it.
-        BROADCAST_DRAFT = None
-        await telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Broadcast started. Please wait."})
-        await telegram_api("editMessageReplyMarkup", {
-            "chat_id": draft["chat_id"],
-            "message_id": callback.get("message", {}).get("message_id"),
-            "reply_markup": {"inline_keyboard": []},
-        })
-        try:
-            total, sent, failed = await run_broadcast(draft["chat_id"], draft["message_id"])
-            await telegram_api("sendMessage", {
-                "chat_id": draft["chat_id"],
-                "text": (
-                    "✅ STORM broadcast finished\n\n"
-                    f"Total recipients: {total}\n"
-                    f"Successfully sent: {sent}\n"
-                    f"Failed: {failed}"
-                ),
-            })
-        except HTTPException as exc:
-            await telegram_api("sendMessage", {"chat_id": draft["chat_id"], "text": f"❌ Broadcast could not be completed: {exc.detail}"})
-        return {"ok": True}
-
     if actor_id != ADMIN_TELEGRAM_ID:
         await telegram_api("answerCallbackQuery", {
             "callback_query_id": callback_id,
